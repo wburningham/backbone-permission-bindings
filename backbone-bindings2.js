@@ -1,47 +1,44 @@
 (function(_, Backbone) {
-    var permissionSplitter = /^(\S+)\s*(.*)$/;
+    var bindingSplitter = /^(\S+)\s*(.*)$/;
 
     _.extend(Backbone.View.prototype, {
-        bindModel: function(permissions, model) {
-
-            // TOOO: first way?
-            // Permissions can be defined three different ways. It can be
+        bindModel: function(bindings) {
+            // Bindings can be defined three different ways. It can be
             // defined on the view as an object or function under the key
-            // 'permissions', or as an object passed to bindModel.
-            permissions = permissions || getValue(this, 'permissions');
+            // 'bindings', or as an object passed to bindModel.
+            bindings = bindings || getValue(this, 'bindings');
 
-            // Skip if no permissions can be found or if the view has no permission model.
-            var permissionsModel = model ? model : this.permissionModel;
-            if (!permissions || !permissionsModel)
+            // Skip if no bindings can be found or if the view has no model.
+            if (!bindings || !this.model)
                 return;
 
-            // Create the private permissions map if it doesn't exist.
-            this._permissions = this._permissions || {};
+            // Create the private bindings map if it doesn't exist.
+            this._bindings = this._bindings || {};
 
-            // Clear any previous permissions for view.
+            // Clear any previous bindings for view.
             this.unbindModel();
 
-            _.each(permissions, function(attribute, permission) {
+            _.each(bindings, function(attribute, binding) {
                 if (!_.isArray(attribute))
                     attribute = [attribute, [null, null]];
 
                 if (!_.isArray(attribute[1]))
                     attribute[1] = [attribute[1], null];
 
-                // A permission can be bound to multiple attributes since it is uni-directional
-                // if (this._permissions[permission])
-                    // throw new Error("'" + permission + "' is already bound to '" + attribute[0] + "'.");
+                // Check to see if a binding is already bound to another attribute.
+                if (this._bindings[binding])
+                    throw new Error("'" + binding + "' is already bound to '" + attribute[0] + "'.");
 
-                // Split permissions just like Backbone.View.events where the first half
+                // Split bindings just like Backbone.View.events where the first half
                 // is the property you want to bind to and the remainder is the selector
                 // for the element in the view that property is for.
-                var match = permission.match(permissionSplitter),
+                var match = binding.match(bindingSplitter),
                     property = match[1],
                     selector = match[2],
-                    // Find element in view for permission. If there is no selector
+                    // Find element in view for binding. If there is no selector
                     // use the view's el.
                     el = (selector) ? this.$(selector) : this.$el,
-                    // Finder binder definition for permission by property. If it can't be found
+                    // Finder binder definition for binding by property. If it can't be found
                     // default to property 'attr'.
                     binder = Backbone.View.Binders[property] || Backbone.View.Binders['__attr__'],
                     // Fetch accessors from binder. The context of the binder is the view
@@ -49,39 +46,68 @@
                     // 'set' must be a function and has one argument. `get` can either be
                     // a function or a list [events, function] .The context of both set and
                     // get is the views's $el.
-                    accessors = binder.call(this, permissionsModel, attribute[0], property);
+                    accessors = binder.call(this, this.model, attribute[0], property);
 
                 if (!accessors)
                     return;
 
-                if (!accessors.set)
+                // Normalize get accessors if only a function was provided. If no
+                // events were provided default to on 'change'.
+                if (!_.isArray(accessors.get))
+                    accessors.get = ['change', accessors.get];
+
+                if (!accessors.get[1] && !accessors.set)
                     return;
 
                 // Event key for model attribute changes.
                 var setTrigger = 'change:' + attribute[0];
+                    // Event keys for view.$el namespaced to the view for unbinding.
+                    getTrigger = _.reduce(accessors.get[0].split(' '), function(memo, event) {
+                        return memo + ' ' + event + '.modelBinding' + this.cid;
+                    }, '', this);
 
                 // Default to identity transformer if not provided for attribute.
-                var setTransformer = attribute[1][0] || identityTransformer;
+                var setTransformer = attribute[1][0] || identityTransformer,
+                    getTransformer = attribute[1][1] || identityTransformer;
 
-                // Create set callback so that we can reference the functions
-                // when it's time to unbind. 'set' for permission to the model events...
+                // Create get and set callbacks so that we can reference the functions
+                // when it's time to unbind. 'set' for binding to the model events...
                 var set = _.bind(function(model, value, options) {
+                    // Skip if this callback was bound to the element that
+                    // triggered the callback.
+                    if (options && options.el && options.el.get(0) == el.get(0))
+                        return;
 
                     // Set the property value for the binder's element.
                     accessors.set.call(el, setTransformer.call(this, value));
                 }, this);
 
+                // ...and 'get' callback for binding to DOM events.
+                var get = _.bind(function(event) {
+                    // Get the property value from the binder's element.
+                    // console.log(attribute[0], getTransformer);
+                    var value = getTransformer.call(this, accessors.get[1].call(el));
+
+                    this.model.set(attribute[0], value, {
+                        el: this.$(event.srcElement)
+                    });
+                }, this);
+
                 if (accessors.set) {
-                    permissionsModel.on(setTrigger, set);
-                    // TODO: Is this neccessary?
+                    this.model.on(setTrigger, set);
                     // Trigger the initial set callback manually so that the view is up
                     // to date with the model bound to it.
-                    // set(permissionsModel, permissionsModel.get(attribute[0]));
+                    set(this.model, this.model.get(attribute[0]));
                 }
 
-                // Save a reference to permission so that we can unbind it later.
-                this._permissions[permission] = {
+                if (accessors.get[1])
+                    this.$el.on(getTrigger, get);
+
+                // Save a reference to binding so that we can unbind it later.
+                this._bindings[binding] = {
+                    getTrigger: getTrigger,
                     setTrigger: setTrigger,
+                    get: get,
                     set: set
                 };
             }, this);
@@ -90,15 +116,17 @@
         },
         unbindModel: function() {
             // Skip if view has been bound or doesn't have a model.
-            var permissionsModel = model ? model : this.permissionModel;
-            if (!this._permissions || !permissionsModel)
+            if (!this._bindings || !this.model)
                 return;
 
-            _.each(this._permissions, function(permission) {
-                if (permission.set)
-                    permissionsModel.off(permission.setTrigger, permission.set);
+            _.each(this._bindings, function(binding) {
+                if (binding.get[1])
+                    this.$el.off(binding.getTrigger);
 
-                delete this._permissions[permission];
+                if (binding.set)
+                    this.model.off(binding.setTrigger, binding.set);
+
+                delete this._bindings[binding];
             }, this);
 
             return this;
@@ -108,6 +136,9 @@
     Backbone.View.Binders = {
         'value': function(model, attribute, property) {
             return {
+                get: ['change keyup', function() {
+                    return this.val();
+                }],
                 set: function(value) {
                     this.val(value);
                 }
@@ -115,6 +146,9 @@
         },
         'text': function(model, attribute, property) {
             return {
+                get: ['change', function() {
+                    return this.text();
+                }],
                 set: function(value) {
                     this.text(value);
                 }
@@ -122,6 +156,9 @@
         },
         'html': function(model, attribute, property) {
             return {
+                get: ['change', function() {
+                    return this.html();
+                }],
                 set: function(value) {
                     this.html(value);
                 }
@@ -140,6 +177,9 @@
         },
         'checked': function(model, attribute, property) {
             return {
+                get: ['change', function() {
+                    return this.prop('checked');
+                }],
                 set: function(value) {
                     this.prop('checked', !!value);
                 }
@@ -165,4 +205,3 @@
             return _.isFunction(object[prop]) ? object[prop]() : object[prop];
     };
 })(window._, window.Backbone);
-
